@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
 import httpx
 import os
 from typing import List, Optional
@@ -67,41 +67,14 @@ def sanitize_message(text: str) -> str:
     
     return text.strip()
 
-# Models
+# Models - Remove validators that throw errors
 class Message(BaseModel):
     role: str
     content: str
 
-    @validator('content')
-    def validate_content(cls, v):
-        if detect_injection(v):
-            raise ValueError("Message contains suspicious patterns")
-        return sanitize_message(v)
-    
-    @validator('role')
-    def validate_role(cls, v):
-        if v not in ['user', 'assistant']:
-            raise ValueError("Invalid role")
-        return v
-
 class ChatRequest(BaseModel):
     messages: List[Message]
     system_prompt: Optional[str] = None
-
-    @validator('messages')
-    def validate_messages(cls, v):
-        if len(v) > 50:
-            raise ValueError("Too many messages")
-        if len(v) == 0:
-            raise ValueError("At least one message required")
-        return v
-    
-    @validator('system_prompt')
-    def validate_system_prompt(cls, v):
-        # Don't allow custom system prompts from frontend
-        if v is not None:
-            raise ValueError("Custom system prompts are not allowed")
-        return v
 
 class ChatResponse(BaseModel):
     message: str
@@ -209,9 +182,7 @@ When responding:
 """
 
 async def send_telegram_notification(message: str, is_injection: bool = False):
-    """
-    Send notification to Telegram
-    """
+    """Send notification to Telegram"""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
@@ -222,28 +193,24 @@ async def send_telegram_notification(message: str, is_injection: bool = False):
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Format the message
         if is_injection:
             telegram_message = f"""
-🚨 **INJECTION ATTEMPT DETECTED**
+🚨 *INJECTION ATTEMPT DETECTED*
 ⏰ Time: {timestamp}
 
 💬 Message:
-{message}
+{message[:500]}
 
 ⚠️ This message was flagged as suspicious and blocked.
 """
         else:
             telegram_message = f"""
-💬 **New Portfolio Question**
+💬 *New Portfolio Question*
 ⏰ Time: {timestamp}
 
 📝 Message:
-{message}
+{message[:500]}
 """
-        
-        # Escape special characters for Telegram MarkdownV2
-        # Or use parse_mode="HTML" for simpler formatting
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post(
@@ -275,14 +242,25 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             detail="LLM_GATEWAY_API_KEY not configured"
         )
     
-    # Get the last user message for notification
+    # Validate input limits
+    if len(request.messages) > 50:
+        raise HTTPException(status_code=400, detail="Too many messages")
+    
+    if len(request.messages) == 0:
+        raise HTTPException(status_code=400, detail="At least one message required")
+    
+    # Don't allow custom system prompts
+    if request.system_prompt is not None:
+        raise HTTPException(status_code=400, detail="Custom system prompts are not allowed")
+    
+    # Get the last user message
     last_user_message = None
     for msg in reversed(request.messages):
         if msg.role == "user":
             last_user_message = msg.content
             break
     
-    # Check for injection attempts
+    # Check for injection attempts in the last user message
     if last_user_message and detect_injection(last_user_message):
         # Send Telegram notification about injection attempt
         background_tasks.add_task(
@@ -291,6 +269,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             is_injection=True
         )
         
+        # Return a friendly response instead of an error
         return ChatResponse(
             message="I'm here to help you learn about Anas's portfolio, projects, and experience. Let's keep our conversation focused on that! What would you like to know?",
             model="injection_detected"
@@ -304,15 +283,21 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             is_injection=False
         )
     
-    # Prepare messages with system prompt
-    messages = []
-    
-    # Always use the default system prompt
-    messages.append({"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
-    
-    # Add conversation messages
+    # Sanitize and validate all messages
+    sanitized_messages = []
     for msg in request.messages:
-        messages.append({"role": msg.role, "content": msg.content})
+        if msg.role not in ['user', 'assistant']:
+            raise HTTPException(status_code=400, detail="Invalid message role")
+        
+        sanitized_content = sanitize_message(msg.content)
+        sanitized_messages.append({
+            "role": msg.role,
+            "content": sanitized_content
+        })
+    
+    # Prepare messages with system prompt
+    messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
+    messages.extend(sanitized_messages)
     
     # Call LLMGateway API
     try:
