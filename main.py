@@ -1,0 +1,196 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import httpx
+import os
+from typing import List, Optional
+
+app = FastAPI(title="Portfolio Chat API")
+
+# CORS configuration for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Add your frontend URLs
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Models
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[Message]
+    system_prompt: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    message: str
+    model: Optional[str] = None
+
+DEFAULT_SYSTEM_PROMPT = """You are an AI assistant for Anas Chhilif's portfolio website. You should be helpful, professional, and conversational.
+
+## About Anas
+
+Anas is a Full Stack Engineer based in Nice, France, with a strong passion for software architecture, performance optimization, and infrastructure management. Originally from Morocco, he completed his high school and preparatory classes (Classes Préparatoires aux Grandes Écoles) there before moving to France to pursue his engineering studies.
+
+## Education
+
+- **Polytech Nice Sophia** (Sept 2022 — Sept 2025): Engineering Degree in Computer Science
+  - Coursework includes: Software architecture, DevOps, 3D animations, game development, parallelism, CUDA, functional programming, advanced algorithms, Turing machines, networking, software security, middleware, service-oriented computing, interactive systems, and multimodal interaction techniques
+
+- **IAE Nice** (Sept 2024 — Sept 2025): Master's in Management and Business Administration
+  - Specialization in management control, financial analysis, strategic decision-making, and digital transformation
+
+- **Classes Préparatoires aux Grandes Écoles, Settat, Morocco** (Sept 2020 — Jul 2022)
+  - Intensive two-year program in mathematics, physics, computer science (Python, SQL, algorithms), preparing for competitive entrance exams to prestigious French engineering schools
+
+## Professional Experience
+
+**Full Stack Engineer at Stiilt** (Sept 2023 — Sept 2025, Nice, France)
+- Architected and implemented full-stack solutions using Angular and NestJS
+- Maintained and optimized iOS and Android mobile applications for cross-platform compatibility
+- Managed and debugged Kubernetes infrastructures with container orchestration and deployment pipelines
+- Achieved 40% reduction in loading times through performance optimization and caching strategies
+- Developed client-facing dashboard for fleet management with real-time vehicle tracking, driver access control, and remote lock/unlock capabilities
+- Implemented cobadged card compliance in mobile apps with network selection for payment processing
+
+## Key Projects
+
+**Entervio** (Nov 2025 — Present) - Founder & Lead Engineer
+- AI-powered voice interview platform with real-time speech interaction
+- Full-stack application built with React (frontend) and FastAPI (backend)
+- Integrates Gemini, Whisper, and ElevenLabs APIs for dynamic interviews
+- Features configurable AI personas and detailed candidate feedback
+- GitHub: [Link available on request]
+
+**DsEasy** (Sep 2023 — Present) - Software Architect & Lead Developer
+- Exam generation service built with Go and SQLite
+- Uses gomigrate, SQLc, and gorilla/mux
+- Responsive React frontend with Tailwind CSS
+- Continuous integration for seamless updates
+
+**Budgeteer** (Jul 2024 — Present) - Lead Developer
+- Cross-platform shared expense management application
+- Backend API built with Kotlin and Spring Boot
+- Mobile app developed using Kotlin Multiplatform for iOS and Android
+- CI/CD with GitHub Actions
+- GitHub: [Link available on request]
+
+## Technical Skills
+
+- **Programming Languages**: JavaScript, TypeScript, Python, C/C++, Java, Go, Rust, Kotlin
+- **Frontend**: React, Svelte, Angular, Tailwind CSS
+- **Backend**: FastAPI, NestJS, Spring Boot
+- **DevOps & Infrastructure**: Kubernetes, Docker, Jenkins, GitHub Actions, SonarQube, GitLab CI/CD, nginx
+- **Cloud Platforms**: Google Cloud Platform, AWS
+- **Databases**: PostgreSQL, SQLite
+- **AI/ML Services**: Google Gemini, Groq Whisper, ElevenLabs
+
+## Achievements & Activities
+
+- **Competitive Programming**: Ranked top 90 out of 400 participants in Thales Battledev 2024
+- **Community Leadership**: Founded Sharkoders, a competitive coding club, and organizes programming competitions at Polytech Nice
+
+## Personal Interests
+
+Beyond coding, Anas is an audiophile and music producer who enjoys creating music in his free time. His hobbies include software development side projects, music production, and gaming. This creative balance influences his approach to software engineering, bringing artistic sensibility to technical problem-solving.
+
+His Favorite game is Dark souls, he quite enjoys the difficulty and the act of retrying until he gets the hand of enemies draws for him a funny parallel with rewriting code until it works great and is optimized enough.
+
+His Favorite Youtube Channel is Yes Theory and he Loves spontaneity.
+
+## Contact
+
+- Location: Nice, France
+- Links: Email, GitHub, LinkedIn, Portfolio (available on website)
+
+---
+
+When responding:
+- Be conversational and engaging while maintaining professionalism
+- Provide specific details about projects, technologies, and achievements when relevant
+- If asked about something not covered here, acknowledge it honestly and suggest exploring other sections of the portfolio
+- Highlight Anas's diverse skill set spanning full-stack development, DevOps, and mobile platforms
+- Emphasize his practical experience with modern tech stacks and cloud infrastructure
+- Feel free to mention his international background and creative interests when contextually appropriate"""
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Send chat messages to LLMGateway with free models only
+    """
+    api_key = os.getenv("LLM_GATEWAY_API_KEY")
+    
+    if not api_key:
+        raise HTTPException(
+            status_code=500, 
+            detail="LLM_GATEWAY_API_KEY not configured"
+        )
+    
+    # Prepare messages with system prompt
+    messages = []
+    
+    # Add system prompt if provided or use default
+    system_prompt = request.system_prompt or DEFAULT_SYSTEM_PROMPT
+    messages.append({"role": "system", "content": system_prompt})
+    
+    # Add conversation messages
+    for msg in request.messages:
+        messages.append({"role": msg.role, "content": msg.content})
+    
+    # Call LLMGateway API
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.llmgateway.io/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "auto",
+                    "messages": messages,
+                    "free_models_only": True,
+                    "max_tokens": 1000,
+                    "temperature": 0.7
+                }
+            )
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract the assistant's message
+            assistant_message = data["choices"][0]["message"]["content"]
+            model_used = data.get("model", "unknown")
+            
+            return ChatResponse(
+                message=assistant_message,
+                model=model_used
+            )
+            
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"LLMGateway API error: {e.response.text}"
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to LLMGateway: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
