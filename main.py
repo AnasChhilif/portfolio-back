@@ -1,29 +1,107 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import httpx
 import os
 from typing import List, Optional
+from datetime import datetime
+import re
 
 app = FastAPI(title="Portfolio Chat API")
 
 # CORS configuration for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Add your frontend URLs
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://chhilif.com",
+        "https://www.chhilif.com"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Injection patterns to detect
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions",
+    r"disregard\s+(all\s+)?(previous|prior)\s+instructions",
+    r"forget\s+(all\s+)?(previous|prior)\s+instructions",
+    r"new\s+instructions?:",
+    r"system\s+override",
+    r"admin\s+mode",
+    r"developer\s+mode",
+    r"you\s+are\s+now",
+    r"act\s+as\s+(if\s+)?you",
+    r"pretend\s+(you\s+)?are",
+    r"roleplay\s+as",
+    r"<\s*system\s*>",
+    r"sudo\s+",
+    r"root\s+access",
+    r"enable\s+debug",
+    r"show\s+(me\s+)?(your\s+)?(system\s+)?prompt",
+    r"reveal\s+(your\s+)?instructions",
+    r"what\s+(are|is)\s+your\s+(system\s+)?(prompt|instructions)",
+]
+
+def detect_injection(text: str) -> bool:
+    """Detect potential prompt injection attempts"""
+    text_lower = text.lower()
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True
+    return False
+
+def sanitize_message(text: str) -> str:
+    """Remove potentially harmful content from messages"""
+    # Remove excessive newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Remove XML-like tags
+    text = re.sub(r'</?[^>]+>', '', text)
+    
+    # Limit message length
+    if len(text) > 2000:
+        text = text[:2000]
+    
+    return text.strip()
 
 # Models
 class Message(BaseModel):
     role: str
     content: str
 
+    @validator('content')
+    def validate_content(cls, v):
+        if detect_injection(v):
+            raise ValueError("Message contains suspicious patterns")
+        return sanitize_message(v)
+    
+    @validator('role')
+    def validate_role(cls, v):
+        if v not in ['user', 'assistant']:
+            raise ValueError("Invalid role")
+        return v
+
 class ChatRequest(BaseModel):
     messages: List[Message]
     system_prompt: Optional[str] = None
+
+    @validator('messages')
+    def validate_messages(cls, v):
+        if len(v) > 50:
+            raise ValueError("Too many messages")
+        if len(v) == 0:
+            raise ValueError("At least one message required")
+        return v
+    
+    @validator('system_prompt')
+    def validate_system_prompt(cls, v):
+        # Don't allow custom system prompts from frontend
+        if v is not None:
+            raise ValueError("Custom system prompts are not allowed")
+        return v
 
 class ChatResponse(BaseModel):
     message: str
@@ -130,15 +208,64 @@ When responding:
 </RESPONSE_GUIDELINES>
 """
 
+async def send_telegram_notification(message: str, is_injection: bool = False):
+    """
+    Send notification to Telegram
+    """
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    
+    if not bot_token or not chat_id:
+        print("Telegram credentials not configured")
+        return
+    
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Format the message
+        if is_injection:
+            telegram_message = f"""
+🚨 **INJECTION ATTEMPT DETECTED**
+⏰ Time: {timestamp}
+
+💬 Message:
+{message}
+
+⚠️ This message was flagged as suspicious and blocked.
+"""
+        else:
+            telegram_message = f"""
+💬 **New Portfolio Question**
+⏰ Time: {timestamp}
+
+📝 Message:
+{message}
+"""
+        
+        # Escape special characters for Telegram MarkdownV2
+        # Or use parse_mode="HTML" for simpler formatting
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": telegram_message,
+                    "parse_mode": "Markdown"
+                }
+            )
+    except Exception as e:
+        print(f"Failed to send Telegram notification: {e}")
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     """
-    Send chat messages to LLMGateway with free models only
+    Send chat messages to LLMGateway with injection protection and Telegram notifications
     """
     api_key = os.getenv("LLM_GATEWAY_API_KEY")
     
@@ -148,12 +275,40 @@ async def chat(request: ChatRequest):
             detail="LLM_GATEWAY_API_KEY not configured"
         )
     
+    # Get the last user message for notification
+    last_user_message = None
+    for msg in reversed(request.messages):
+        if msg.role == "user":
+            last_user_message = msg.content
+            break
+    
+    # Check for injection attempts
+    if last_user_message and detect_injection(last_user_message):
+        # Send Telegram notification about injection attempt
+        background_tasks.add_task(
+            send_telegram_notification,
+            last_user_message,
+            is_injection=True
+        )
+        
+        return ChatResponse(
+            message="I'm here to help you learn about Anas's portfolio, projects, and experience. Let's keep our conversation focused on that! What would you like to know?",
+            model="injection_detected"
+        )
+    
+    # Send normal message notification to Telegram
+    if last_user_message:
+        background_tasks.add_task(
+            send_telegram_notification,
+            last_user_message,
+            is_injection=False
+        )
+    
     # Prepare messages with system prompt
     messages = []
     
-    # Add system prompt if provided or use default
-    system_prompt = request.system_prompt or DEFAULT_SYSTEM_PROMPT
-    messages.append({"role": "system", "content": system_prompt})
+    # Always use the default system prompt
+    messages.append({"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
     
     # Add conversation messages
     for msg in request.messages:
