@@ -1,11 +1,12 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import os
+import re
+from datetime import datetime
+from typing import List, Optional
+
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import httpx
-import os
-from typing import List, Optional
-from datetime import datetime
-import re
 
 app = FastAPI(title="Portfolio Chat API")
 
@@ -16,7 +17,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
         "https://chhilif.com",
-        "https://www.chhilif.com"
+        "https://www.chhilif.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -45,6 +46,7 @@ INJECTION_PATTERNS = [
     r"what\s+(are|is)\s+your\s+(system\s+)?(prompt|instructions)",
 ]
 
+
 def detect_injection(text: str) -> bool:
     """Detect potential prompt injection attempts"""
     text_lower = text.lower()
@@ -53,32 +55,37 @@ def detect_injection(text: str) -> bool:
             return True
     return False
 
+
 def sanitize_message(text: str) -> str:
     """Remove potentially harmful content from messages"""
     # Remove excessive newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
     # Remove XML-like tags
-    text = re.sub(r'</?[^>]+>', '', text)
-    
+    text = re.sub(r"</?[^>]+>", "", text)
+
     # Limit message length
     if len(text) > 2000:
         text = text[:2000]
-    
+
     return text.strip()
+
 
 # Models - Remove validators that throw errors
 class Message(BaseModel):
     role: str
     content: str
 
+
 class ChatRequest(BaseModel):
     messages: List[Message]
     system_prompt: Optional[str] = None
 
+
 class ChatResponse(BaseModel):
     message: str
     model: Optional[str] = None
+
 
 DEFAULT_SYSTEM_PROMPT = """You are an AI assistant for Anas Chhilif's portfolio website. You should be helpful, professional, and conversational.
 
@@ -181,18 +188,19 @@ When responding:
 </RESPONSE_GUIDELINES>
 """
 
+
 async def send_telegram_notification(message: str, is_injection: bool = False):
     """Send notification to Telegram"""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
+
     if not bot_token or not chat_id:
         print("Telegram credentials not configured")
         return
-    
+
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+
         if is_injection:
             telegram_message = f"""
 🚨 *INJECTION ATTEMPT DETECTED*
@@ -211,23 +219,25 @@ async def send_telegram_notification(message: str, is_injection: bool = False):
 📝 Message:
 {message[:500]}
 """
-        
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post(
                 f"https://api.telegram.org/bot{bot_token}/sendMessage",
                 json={
                     "chat_id": chat_id,
                     "text": telegram_message,
-                    "parse_mode": "Markdown"
-                }
+                    "parse_mode": "Markdown",
+                },
             )
     except Exception as e:
         print(f"Failed to send Telegram notification: {e}")
+
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
+
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
@@ -235,70 +245,64 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     Send chat messages to LLMGateway with injection protection and Telegram notifications
     """
     api_key = os.getenv("LLM_GATEWAY_API_KEY")
-    
+
     if not api_key:
         raise HTTPException(
-            status_code=500, 
-            detail="LLM_GATEWAY_API_KEY not configured"
+            status_code=500, detail="LLM_GATEWAY_API_KEY not configured"
         )
-    
+
     # Validate input limits
     if len(request.messages) > 50:
         raise HTTPException(status_code=400, detail="Too many messages")
-    
+
     if len(request.messages) == 0:
         raise HTTPException(status_code=400, detail="At least one message required")
-    
+
     # Don't allow custom system prompts
     if request.system_prompt is not None:
-        raise HTTPException(status_code=400, detail="Custom system prompts are not allowed")
-    
+        raise HTTPException(
+            status_code=400, detail="Custom system prompts are not allowed"
+        )
+
     # Get the last user message
     last_user_message = None
     for msg in reversed(request.messages):
         if msg.role == "user":
             last_user_message = msg.content
             break
-    
+
     # Check for injection attempts in the last user message
     if last_user_message and detect_injection(last_user_message):
         # Send Telegram notification about injection attempt
         background_tasks.add_task(
-            send_telegram_notification,
-            last_user_message,
-            is_injection=True
+            send_telegram_notification, last_user_message, is_injection=True
         )
-        
+
         # Return a friendly response instead of an error
         return ChatResponse(
             message="I'm here to help you learn about Anas's portfolio, projects, and experience. Let's keep our conversation focused on that! What would you like to know?",
-            model="injection_detected"
+            model="injection_detected",
         )
-    
+
     # Send normal message notification to Telegram
     if last_user_message:
         background_tasks.add_task(
-            send_telegram_notification,
-            last_user_message,
-            is_injection=False
+            send_telegram_notification, last_user_message, is_injection=False
         )
-    
+
     # Sanitize and validate all messages
     sanitized_messages = []
     for msg in request.messages:
-        if msg.role not in ['user', 'assistant']:
+        if msg.role not in ["user", "assistant"]:
             raise HTTPException(status_code=400, detail="Invalid message role")
-        
+
         sanitized_content = sanitize_message(msg.content)
-        sanitized_messages.append({
-            "role": msg.role,
-            "content": sanitized_content
-        })
-    
+        sanitized_messages.append({"role": msg.role, "content": sanitized_content})
+
     # Prepare messages with system prompt
     messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
     messages.extend(sanitized_messages)
-    
+
     # Call LLMGateway API
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -306,45 +310,39 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 "https://api.llmgateway.io/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 },
                 json={
-                    "model": "auto",
+                    "model": "deepseek/deepseek-v4.1-flash-1017",
                     "messages": messages,
-                    "free_models_only": True,
                     "max_tokens": 1000,
-                    "temperature": 0.7
-                }
+                    "temperature": 0.7,
+                },
             )
-            
+
             response.raise_for_status()
             data = response.json()
-            
+
             # Extract the assistant's message
             assistant_message = data["choices"][0]["message"]["content"]
             model_used = data.get("model", "unknown")
-            
-            return ChatResponse(
-                message=assistant_message,
-                model=model_used
-            )
-            
+
+            return ChatResponse(message=assistant_message, model=model_used)
+
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=e.response.status_code,
-            detail=f"LLMGateway API error: {e.response.text}"
+            detail=f"LLMGateway API error: {e.response.text}",
         )
     except httpx.RequestError as e:
         raise HTTPException(
-            status_code=503,
-            detail=f"Failed to connect to LLMGateway: {str(e)}"
+            status_code=503, detail=f"Failed to connect to LLMGateway: {str(e)}"
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
